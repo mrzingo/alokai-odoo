@@ -26,8 +26,7 @@ class ProductProduct(models.Model):
                 'product_type': ', '.join(product.public_categ_ids.mapped('display_name')),
                 'condition': 'new',
                 'id': product.id,
-                # product.free_qty > 0
-                'availability': 'in stock',
+                'availability': 'in stock' if product.free_qty > 0 else 'out of stock',
                 'brand': self.env.user.company_id.display_name,
                 'mpn': product.default_code,
                 'adult': 'yes',
