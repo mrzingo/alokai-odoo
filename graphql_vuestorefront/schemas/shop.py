@@ -36,6 +36,15 @@ class ShoppingCartQuery(graphene.ObjectType):
         if order:
             order.order_line.filtered(lambda l: not l.product_id.active).unlink()
 
+            # User
+            user = env['res.users'].sudo().search([('id', '=', env.uid)], limit=1)
+            # When Cart is created by one Public User
+            if not user:
+                user = env.user
+
+            # Update SO
+            order._update_sale_order(website, user)
+
             fbt = order.\
                 mapped('order_line').\
                 mapped('product_id').\
@@ -107,6 +116,9 @@ class CartAddMultipleItems(graphene.Mutation):
             product_id = product['id']
             quantity = product['quantity']
             order._cart_update(product_id=product_id, add_qty=quantity)
+        # reset carrier
+        order.carrier_id = False
+        order._remove_delivery_line()
         return CartData(order=order)
 
 
@@ -128,6 +140,9 @@ class CartUpdateMultipleItems(graphene.Mutation):
             # Reset Warning Stock Message always before a new update
             line.shop_warning = ""
             order._cart_update(product_id=line.product_id.id, line_id=line.id, set_qty=quantity)
+        # reset carrier
+        order.carrier_id = False
+        order._remove_delivery_line()
         return CartData(order=order)
 
 
@@ -145,6 +160,9 @@ class CartRemoveMultipleItems(graphene.Mutation):
         for line_id in line_ids:
             line = order.order_line.filtered(lambda rec: rec.id == line_id)
             line.unlink()
+        # reset carrier
+        order.carrier_id = False
+        order._remove_delivery_line()
         return CartData(order=order)
 
 

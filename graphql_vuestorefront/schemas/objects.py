@@ -153,7 +153,7 @@ class Country(OdooObjectType):
     image_url = graphene.String()
 
     def resolve_states(self, info):
-        return self.state_ids or None
+        return self.state_ids.sorted('name') or None
 
 
 class Company(OdooObjectType):
@@ -271,7 +271,8 @@ class Partner(OdooObjectType):
 
     def resolve_is_public(self, info):
         website = self.env['website'].get_current_website()
-        return True if not self or not self.user_ids or self.user_ids == website.user_id else False
+        user = self.with_context(active_test=False).user_ids
+        return True if not self or (user and user == website.user_id) else False
 
 
 class WishlistItem(OdooObjectType):
@@ -570,7 +571,7 @@ class Product(OdooObjectType):
         return self.website_ribbon_id or None
 
     def resolve_is_in_stock(self, info):
-        return bool(self.free_qty > 0)
+        return self.has_stock
 
     def resolve_is_in_wishlist(self, info):
         env = info.context["env"]

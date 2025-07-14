@@ -8,7 +8,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta
 from odoo import models, fields, api, _
 from odoo.tools.float_utils import float_round
-from odoo.addons.http_routing.models.ir_http import slug, slugify
+from odoo.addons.http_routing.models.ir_http import slugify
 from odoo.exceptions import ValidationError
 
 
@@ -17,7 +17,7 @@ class ProductTemplate(models.Model):
 
     @api.model
     def _graphql_get_search_order(self, sort):
-        sorting = ''
+        sorting = 'has_stock DESC'
         for field, val in sort.items():
             if sorting:
                 sorting += ', '
@@ -77,7 +77,7 @@ class ProductTemplate(models.Model):
         if search:
             for srch in search.split(" "):
                 domains.append([
-                    '|', '|', ('name', 'ilike', srch), ('description_sale', 'like', srch), ('default_code', 'like', srch)])
+                    '|', '|', ('name', 'ilike', srch), ('description_sale', 'ilike', srch), ('default_code', 'ilike', srch)])
 
         # Used for improving attributes filtering
         attributes_partial_domain = domains.copy()
@@ -132,11 +132,15 @@ class ProductTemplate(models.Model):
         if base_url and base_url[-1:] == '/':
             base_url = base_url[:-1]
 
+        website_domain = website.domain or ''
+        if website_domain and website_domain[-1:] == '/':
+            website_domain = website_domain[:-1]
+
         for product in self:
             # Get list of images
             images = list()
             if product.image_1920:
-                images.append(f'{base_url}/web/image/product.product/{product.id}/image')
+                images.append(f'{base_url}/web/image/product.template/{product.id}/image_1920')
 
             json_ld = {
                 "@context": "https://schema.org/",
@@ -145,7 +149,7 @@ class ProductTemplate(models.Model):
                 "image": images,
                 "offers": {
                     "@type": "Offer",
-                    "url": f"{website.domain or ''}/product/{slug(product)}",
+                    "url": f"{website_domain}{product.website_slug}",
                     "priceCurrency": product.currency_id.name,
                     "price": product.list_price,
                     "itemCondition": "https://schema.org/NewCondition",
@@ -210,7 +214,7 @@ class ProductTemplate(models.Model):
                     slug_name = slugify(product.name or '').strip().strip('-')
                     product.website_slug = f'{prefix}/{slug_name}-{product.id}'
 
-    @api.depends('product_variant_ids')
+    @api.depends('product_variant_ids', 'product_variant_id', 'attribute_line_ids')
     def _compute_variant_attribute_value_ids(self):
         """
         Used to filter attribute values on the website.
@@ -246,10 +250,13 @@ class ProductTemplate(models.Model):
         sale_count_map = {group['product_id'][0]: group['product_uom_qty'] for group in sale_groups}
 
         for product in self:
-            product_id = product.product_variant_id.id
-            sales_count = sale_count_map.get(product_id, 0)
-            sales_count = float_round(sales_count, precision_rounding=product.uom_id.rounding)
-            product.recent_sales_count = sales_count + product.recent_sales_count_increment
+            if product.detailed_type in ['product', 'consu']:
+                product_id = product.product_variant_id.id
+                sales_count = sale_count_map.get(product_id, 0)
+                sales_count = float_round(sales_count, precision_rounding=product.uom_id.rounding)
+                product.recent_sales_count = sales_count + product.recent_sales_count_increment
+            else:
+                product.recent_sales_count = 0
 
     @api.depends('published_datetime')
     def _compute_published_hours(self):
@@ -277,9 +284,16 @@ class ProductTemplate(models.Model):
                                                      readonly=True)
     product_tmpl_redis_stock_ids = fields.One2many('product.template.redis_stock', 'product_id', 'Redis Stock',
                                                    readonly=True)
-    published_datetime = fields.Datetime('Published On', help='Datetime when the product was published', readonly=True)
+    published_datetime = fields.Datetime('Published On', help='Datetime when the product was published', readonly=True,
+                                         copy=False)
     published_hours = fields.Integer('Hours Published', compute='_compute_published_hours',
                                      help='Total hours the product has been published', readonly=True)
+    has_stock = fields.Boolean(string='Has Stock', compute='_compute_has_stock', store=True)
+
+    @api.depends('product_variant_ids.product_redis_stock_ids')
+    def _compute_has_stock(self):
+        for template in self:
+            template.has_stock = sum(template.product_variant_ids.mapped('product_redis_stock_ids.quantity')) > 0
 
     @api.model_create_multi
     def create(self, vals_list):
@@ -291,7 +305,7 @@ class ProductTemplate(models.Model):
     def write(self, vals):
         if 'website_published' in vals:
             for product in self:
-                if vals['website_published'] and not product.website_published:
+                if vals['website_published'] and not product.website_published and not product.published_datetime:
                     vals['published_datetime'] = datetime.now()
 
         res = super(ProductTemplate, self).write(vals)
@@ -329,16 +343,24 @@ class ProductTemplate(models.Model):
     @api.model
     def calculate_frequently_bought_together(self):
         ProductTemplateFBT = self.env['product.template.fbt']
-
         ProductTemplateFBT.search([]).unlink()
-        sale_groups = self.env['sale.report'].search([])
+
+        lookback_days = int(self.env['ir.config_parameter'].sudo().get_param('vsf_recent_sales_count_days', 30))
+        date_days_ago = fields.Datetime.now() - timedelta(days=lookback_days)
+        done_states = self.env['sale.report'].sudo()._get_done_states()
+        domain = [
+            ('state', 'in', done_states),
+            ('date', '>=', date_days_ago),
+        ]
+        sale_groups = self.env['sale.report'].search(domain)
 
         order_to_products = defaultdict(list)
         for sale_group in sale_groups:
-            order_id = sale_group.order_reference
-            product_id = sale_group.product_id.product_tmpl_id.id
-            qty = sale_group.product_uom_qty
-            order_to_products[order_id].append((product_id, qty))
+            if sale_group.product_id.detailed_type in ['product', 'consu']:
+                order_id = sale_group.order_reference
+                product_id = sale_group.product_id.product_tmpl_id.id
+                qty = sale_group.product_uom_qty
+                order_to_products[order_id].append((product_id, qty))
 
         product_relations = defaultdict(lambda: defaultdict(float))
         for order, products in order_to_products.items():
@@ -383,6 +405,12 @@ class ProductProduct(models.Model):
     _inherit = 'product.product'
 
     product_redis_stock_ids = fields.One2many('product.product.redis_stock', 'product_id', 'Redis Stock', readonly=True)
+    has_stock = fields.Boolean(string='Has Stock', compute='_compute_has_stock', store=True)
+
+    @api.depends('product_redis_stock_ids')
+    def _compute_has_stock(self):
+        for product in self:
+            product.has_stock = sum(product.product_redis_stock_ids.mapped('quantity')) > 0
 
     def _compute_json_ld(self):
         env = self.env
@@ -391,11 +419,15 @@ class ProductProduct(models.Model):
         if base_url and base_url[-1:] == '/':
             base_url = base_url[:-1]
 
+        website_domain = website.domain or ''
+        if website_domain and website_domain[-1:] == '/':
+            website_domain = website_domain[:-1]
+
         for product in self:
             # Get list of images
             images = list()
             if product.image_1920:
-                images.append(f'{base_url}/web/image/product.product/{product.id}/image')
+                images.append(f'{base_url}/web/image/product.product/{product.id}/image_1920')
 
             json_ld = {
                 "@context": "https://schema.org/",
@@ -404,7 +436,7 @@ class ProductProduct(models.Model):
                 "image": images,
                 "offers": {
                     "@type": "Offer",
-                    "url": f"{website.domain or ''}/product/{slug(product)}",
+                    "url": f"{website_domain}{product.website_slug}",
                     "priceCurrency": product.currency_id.name,
                     "price": product.list_price,
                     "itemCondition": "https://schema.org/NewCondition",
@@ -515,15 +547,16 @@ class ProductPublicCategory(models.Model):
 
     def _compute_json_ld(self):
         website = self.env['website'].get_current_website()
-        base_url = website.domain or ''
-        if base_url and base_url[-1] == '/':
-            base_url = base_url[:-1]
+
+        website_domain = website.domain or ''
+        if website_domain and website_domain[-1:] == '/':
+            website_domain = website_domain[:-1]
 
         for category in self:
             json_ld = {
                 "@context": "https://schema.org",
                 "@type": "CollectionPage",
-                "url": f'{base_url}{category.website_slug}',
+                "url": f'{website_domain}{category.website_slug}',
                 "name": category.display_name,
             }
 
