@@ -163,6 +163,8 @@ class Website(models.Model):
             if cursor == 0:
                 break
 
+        redis_client.close()
+
         return {
             'type': 'ir.actions.client',
             'tag': 'display_notification',
@@ -388,8 +390,8 @@ class BlogPost(models.Model):
                     "@type": "Organization",
                     "name": website and website.display_name
                 },
-                "datePublished": blog.published_date.strftime('%Y-%m-%dT%H:%M:%S+00:00'),
-                "dateModified": blog.post_date.strftime('%Y-%m-%dT%H:%M:%S+00:00'),
+                "datePublished": blog.published_date and blog.published_date.strftime('%Y-%m-%dT%H:%M:%S+00:00') or '',
+                "dateModified": blog.post_date and blog.post_date.strftime('%Y-%m-%dT%H:%M:%S+00:00') or '',
                 "image": get_image_url(blog)
             }
 
@@ -398,3 +400,25 @@ class BlogPost(models.Model):
     website_slug = fields.Char('Website Slug', compute='_compute_website_slug', store=True, readonly=True,
                                translate=True)
     image = fields.Image(string='Image', required=True)
+
+
+class WebsiteQueryHash(models.Model):
+    _name = 'website.graphql.hash'
+    _description = 'GraphQL Unique Query Hash'
+
+    hash = fields.Char(required=True, index=True, unique=True)
+
+
+class WebsiteQueryNotCached(models.Model):
+    _name = 'website.graphql.not_cached'
+    _description = 'GraphQL Not Cached Queries'
+
+    hash = fields.Char(required=True, index=True)
+    query = fields.Char(required=True)
+    variables = fields.Char(required=True)
+    count = fields.Integer(default=1)
+
+    @api.model
+    def clean(self):
+        self.env.cr.execute("TRUNCATE TABLE website_graphql_hash RESTART IDENTITY CASCADE")
+        self.env.cr.execute("TRUNCATE TABLE website_graphql_not_cached RESTART IDENTITY CASCADE")

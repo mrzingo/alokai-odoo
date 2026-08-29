@@ -27,23 +27,25 @@ class ShoppingCartQuery(graphene.ObjectType):
     def resolve_cart(self, info):
         env = info.context["env"]
         website = env['website'].get_current_website()
-        order = website.sale_get_order(force_create=True)
+        order = website.sale_get_order()
         fbt = None
 
         if order and order.state != 'draft':
             request.session['sale_order_id'] = None
-            order = website.sale_get_order(force_create=True)
+            order = website.sale_get_order()
         if order:
             order.order_line.filtered(lambda l: not l.product_id.active).unlink()
 
             # User
             user = env['res.users'].sudo().search([('id', '=', env.uid)], limit=1)
             # When Cart is created by one Public User
-            if not user:
+            if user.partner_id.is_public_user:
                 user = env.user
+                # Update SO
+                order._update_sale_order(website, user)
 
-            # Update SO
-            order._update_sale_order(website, user)
+            ICP = request.env['ir.config_parameter'].sudo()
+            fbt_limit = int(ICP.get_param('vsf_fbt_limit', 10))
 
             fbt = order.\
                 mapped('order_line').\
@@ -51,7 +53,10 @@ class ShoppingCartQuery(graphene.ObjectType):
                 mapped('product_tmpl_id').\
                 frequently_bought_together_ids.\
                 sorted(key=lambda r: r.qty, reverse=True)
-            fbt = fbt.mapped('related_product_id')
+            fbt = (
+                fbt.mapped('related_product_id')
+                .filtered(lambda p: not p.website_id or p.website_id == website)
+            )[:fbt_limit]
 
         return CartData(order=order, frequently_bought_together=fbt)
 
@@ -194,7 +199,7 @@ class CreateUpdatePartner(graphene.Mutation):
         partner = order.partner_id
 
         # Is public user
-        if partner.id == website.user_id.sudo().partner_id.id:
+        if partner.is_public_user:
             partner = env['res.partner'].sudo().create(data)
 
             order.write({

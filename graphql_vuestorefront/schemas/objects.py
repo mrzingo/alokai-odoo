@@ -40,8 +40,10 @@ PaymentTransactionState = graphene.Enum('PaymentTransactionState', [('Draft', 'd
                                                                ('Canceled', 'cancel'), ('Error', 'error')])
 
 DeliveryStatus = graphene.Enum('DeliveryStatus', [('NotDelivered', 'pending'), ('Started', 'started'),
-                                        ('PartiallyDelivered', 'partial'), ('FullyDelivered', 'full')])
-
+                                        ('PartiallyDelivered', 'partial'), ('FullyDelivered', 'full'),
+                                        ('Cancelled', 'cancel')])
+ProductType = graphene.Enum('ProductType', [('Consumable', 'consu'), ('Service', 'service'),
+                                        ('StorableProduct', 'product')])
 
 class SortEnum(graphene.Enum):
     ASC = 'ASC'
@@ -267,12 +269,12 @@ class Partner(OdooObjectType):
 
     def resolve_current_pricelist(self, info):
         website = self.env['website'].get_current_website()
+        if not self.is_public_user and self.property_product_pricelist:
+            request.session['website_sale_current_pl'] = self.property_product_pricelist.id
         return website._get_current_pricelist()
 
     def resolve_is_public(self, info):
-        website = self.env['website'].get_current_website()
-        user = self.with_context(active_test=False).user_ids
-        return True if not self or (user and user == website.user_id) else False
+        return not self or self.is_public_user
 
 
 class WishlistItem(OdooObjectType):
@@ -502,6 +504,7 @@ class Product(OdooObjectType):
     first_variant = graphene.Field((lambda: Product), description='Specific to use in Product Template')
     json_ld = generic.GenericScalar()
     tags = graphene.List(graphene.NonNull(lambda: ProductTag))
+    product_type = ProductType()
 
     def resolve_type_id(self, info):
         if self.detailed_type == 'product':
@@ -591,15 +594,23 @@ class Product(OdooObjectType):
         return self.website_slug
 
     def resolve_alternative_products(self, info):
-        return self.alternative_product_ids or None
+        website = request.website
+        return self.alternative_product_ids.filtered(lambda p: not p.website_id or p.website_id == website) or None
 
     def resolve_accessory_products(self, info):
-        return self.accessory_product_ids or None
+        website = request.website
+        return self.accessory_product_ids.filtered(lambda p: not p.website_id or p.website_id == website) or None
 
     def resolve_frequently_bought_together(self, info):
         if self.frequently_bought_together_ids:
+            website = request.website
+            ICP = request.env['ir.config_parameter'].sudo()
+            fbt_limit = int(ICP.get_param('graphql_vuestorefront.vsf_fbt_limit', 10))
             fbt = self.frequently_bought_together_ids.sorted(key=lambda r: r.qty, reverse=True)
-            return fbt.mapped('related_product_id')
+            return (
+                fbt.mapped('related_product_id')
+                .filtered(lambda p: not p.website_id or p.website_id == website)
+            )[:fbt_limit]
         return None
 
     # Specific to use in Product Variant
@@ -655,6 +666,10 @@ class Product(OdooObjectType):
     # Specific to use in Product Template
     def resolve_combination_info(self, info):
         pricing_info = get_product_pricing_info(self.product_variant_id)
+
+        if not pricing_info:
+            return None
+
         if pricing_info.get('currency', False) and pricing_info['currency'].id:
             pricing_info['currency'] = {
                 'id': pricing_info['currency'].id,
@@ -696,6 +711,9 @@ class Product(OdooObjectType):
     def resolve_tags(self, info):
         return self.product_tag_ids.filtered(lambda t: t.visible_on_ecommerce) or None
 
+    def resolve_product_type(self, info):
+        return self.detailed_type or None
+
 
 class Payment(OdooObjectType):
     id = graphene.Int()
@@ -710,6 +728,7 @@ class PaymentTransaction(OdooObjectType):
     payment = graphene.Field(lambda: Payment)
     amount = graphene.Float()
     currency = graphene.Field(lambda: Currency)
+    payment_method = graphene.Field(lambda: PaymentMethod)
     provider = graphene.String()
     provider_reference = graphene.String()
     company = graphene.Field(lambda: Partner)
@@ -721,6 +740,9 @@ class PaymentTransaction(OdooObjectType):
 
     def resolve_currency(self, info):
         return self.currency_id or None
+
+    def resolve_payment_method(self, info):
+        return self.payment_method_id or None
 
     def resolve_provider(self, info):
         return self.provider_id.name or None

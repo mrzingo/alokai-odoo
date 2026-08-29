@@ -5,10 +5,12 @@
 import os
 import json
 import logging
-import pprint
+import hashlib
+from graphql import parse, print_ast
 
 from odoo import http
 from odoo.addons.web.controllers.binary import Binary
+from odoo.addons.website_sale.controllers.main import PaymentPortal
 from odoo.addons.graphql_base import GraphQLControllerMixin
 from odoo.http import request, Response
 from urllib.parse import urlparse
@@ -62,30 +64,65 @@ class GraphQLController(http.Controller, GraphQLControllerMixin):
 
     def _process_request(self, schema, data):
         # Set the vsf_debug_mode value that exist in the settings
-        ICP = http.request.env['ir.config_parameter'].sudo()
+        env = http.request.env
+
+        ICP = env['ir.config_parameter'].sudo()
         vsf_debug_mode = ICP.get_param('vsf_debug_mode', False)
         if vsf_debug_mode:
+            request = http.request.httprequest
+
+            # Headers
+            headers = request.headers.environ and dict(request.headers.environ) or {}
+            headers = json.dumps(headers, indent=2)
+
+            # Query / Mutation
             try:
-                request = http.request.httprequest
-                _logger.info('# ------------------------------- GRAPHQL: DEBUG MODE -------------------------------- #')
-                _logger.info('')
-                _logger.info('# ------------------------------------------------------- #')
-                _logger.info('#                          HEADERS                        #')
-                _logger.info('# ------------------------------------------------------- #')
-                _logger.info('\n%s', pprint.pformat(request.headers.environ))
-                _logger.info('')
-                _logger.info('# ------------------------------------------------------- #')
-                _logger.info('#                     QUERY / MUTATION                    #')
-                _logger.info('# ------------------------------------------------------- #')
-                _logger.info('\n%s', data.get('query', None))
-                _logger.info('')
-                _logger.info('# ------------------------------------------------------- #')
-                _logger.info('#                         ARGUMENTS                       #')
-                _logger.info('# ------------------------------------------------------- #')
-                _logger.info('\n%s', request.args.get('variables', None))
-                _logger.info('\n%s', data.get('variables', None))
-                _logger.info('')
-                _logger.info('# ------------------------------------------------------------------------------------ #')
+                query = parse(data.get('query') or '')
+                query = print_ast(query)
+            except Exception:
+                query = data.get('query') or ''
+
+            variables = data.get('variables') or '{}'
+            if isinstance(variables, str):
+                variables = json.loads(variables)
+            variables = json.dumps(variables, indent=2)
+
+            query_hash = hashlib.sha256((query + variables).encode('utf-8')).hexdigest()
+
+            WebsiteGraphqlHash = env['website.graphql.hash'].sudo()
+            if not WebsiteGraphqlHash.search([('hash', '=', query_hash)], limit=1):
+                # First time seeing this hash
+                WebsiteGraphqlHash.create({'hash': query_hash})
+            else:
+                WebsiteQueryNotCached = env['website.graphql.not_cached'].sudo()
+
+                # Seen before, log not cached
+                not_cached_hash = WebsiteQueryNotCached.search([('hash', '=', query_hash)], limit=1)
+                if not_cached_hash:
+                    not_cached_hash.write({
+                        'count': not_cached_hash.count + 1,
+                    })
+                else:
+                    WebsiteQueryNotCached.create({
+                        'hash': query_hash,
+                        'query': query,
+                        'variables': variables,
+                        'count': 1,
+                    })
+
+            try:
+                def log_section(title, content):
+                    separator = '-' * 100
+                    _logger.info(separator)
+                    _logger.info(f'{title:^100}')  # Centered title in chars width
+                    _logger.info(separator)
+                    if content:
+                        _logger.info(content)
+
+                log_section(f'GRAPHQL DEBUG: {query_hash}', '')
+                log_section('HEADERS', headers)
+                log_section('QUERY / MUTATION', query)
+                log_section('VARIABLES', f"{variables}")
             except:
                 pass
         return super(GraphQLController, self)._process_request(schema, data)
@@ -231,4 +268,13 @@ class GraphQLController(http.Controller, GraphQLControllerMixin):
                 except:
                     pass
 
+            redis_client.close()
+
         return request.redirect('/shop/checkout')
+
+
+class AlokaiPaymentPortal(PaymentPortal):
+    @http.route('/shop/payment/transaction/<int:order_id>', type='json', auth='public', website=True)
+    def shop_payment_transaction(self, order_id, access_token, **kwargs):
+        request.session['alokai_last_sale_order_id'] = order_id
+        return super(AlokaiPaymentPortal, self).shop_payment_transaction(order_id, access_token, **kwargs)

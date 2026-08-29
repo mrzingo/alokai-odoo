@@ -10,7 +10,6 @@ import json
 from odoo import _
 
 from odoo.addons.payment import utils as payment_utils
-from odoo.addons.website_sale.controllers.main import PaymentPortal
 from odoo.addons.payment_stripe_vsf.controllers.main import StripeControllerInherit
 from odoo.addons.payment_stripe.const import API_VERSION, PROXY_URL
 
@@ -36,6 +35,10 @@ class StripeApplepayGetShippingOptionsResult(graphene.ObjectType):
 
 class StripeApplepaySelectShippingMethodResult(graphene.ObjectType):
     stripe_applepay_select_shipping_method = generic.GenericScalar()
+
+
+class StripeUpdatePaymentIntentResult(graphene.ObjectType):
+    stripe_update_payment_intent = generic.GenericScalar()
 
 
 class StripeProviderInfo(graphene.Mutation):
@@ -97,12 +100,28 @@ class StripeGetInlineFormValues(graphene.Mutation):
         stripe_get_inline_form_values = payment_provider._stripe_get_inline_form_values(
             amount=order.amount_total,
             currency=order.currency_id,
-            partner_id=order.partner_id.id,
+            partner_id=order.partner_invoice_id.id,
             is_validation=True,
             sale_order_id=order.id
         )
         stripe_get_inline_form_values = json.loads(stripe_get_inline_form_values)
         stripe_get_inline_form_values['payment_methods'] = payment_provider.payment_method_ids.mapped('code')
+
+        # Shipping Info
+        partner_shipping_id = order.partner_shipping_id
+        stripe_get_inline_form_values['shipping'] = {
+            'name': partner_shipping_id.name or '',
+            'phone': partner_shipping_id.phone or '',
+            'address': {
+                'line1': partner_shipping_id.street or '',
+                'line2': partner_shipping_id.street2 or '',
+                'city': partner_shipping_id.city or '',
+                'state': partner_shipping_id.state_id.code or '',
+                'country': partner_shipping_id.country_id.code or '',
+                'postal_code': partner_shipping_id.zip or '',
+            },
+        }
+
         # Condition to prevent calling the "Affirm" payment_method when the amount is less than 50.00$
         if float(order.amount_total) < 50.00:
             if 'affirm' in stripe_get_inline_form_values['payment_methods']:
@@ -114,11 +133,12 @@ class StripeTransaction(graphene.Mutation):
     class Arguments:
         provider_id = graphene.Int(required=True)
         tokenization_requested = graphene.Boolean(default_value=False)
+        is_applepay_express_transaction = graphene.Boolean(default_value=False)
 
     Output = StripeTransactionResult
 
     @staticmethod
-    def mutate(self, info, provider_id, tokenization_requested):
+    def mutate(self, info, provider_id, tokenization_requested, is_applepay_express_transaction):
         env = info.context["env"]
         PaymentProvider = env['payment.provider'].sudo()
         PaymentTransaction = env['payment.transaction'].sudo()
@@ -142,10 +162,13 @@ class StripeTransaction(graphene.Mutation):
             raise GraphQLError(_('Payment Provider "Stripe" does not exist.'))
 
         # Generate a new access token
-        access_token = payment_utils.generate_access_token(order.partner_id.id, order.amount_total, order.currency_id.id)
+        access_token = payment_utils.generate_access_token(order.partner_invoice_id.id, order.amount_total, order.currency_id.id)
         order.access_token = access_token
 
-        transaction = PaymentPortal().shop_payment_transaction(
+        # TODO: improve this late import to fix circular import
+        from odoo.addons.graphql_vuestorefront.controllers.main import AlokaiPaymentPortal
+
+        transaction = AlokaiPaymentPortal().shop_payment_transaction(
             order_id=order.id,
             access_token=order.access_token,
             provider_id=provider_id,
@@ -159,8 +182,15 @@ class StripeTransaction(graphene.Mutation):
 
         transaction_id = PaymentTransaction.search([('reference', '=', transaction['reference'])], limit=1)
 
+        client_secret = transaction['client_secret']
+        payment_intent_id = client_secret.split('_secret')[0]
+
         # Update the field created_on_vsf
-        transaction_id.created_on_vsf = True
+        transaction_id.write({
+            'created_on_vsf': True,
+            'stripe_payment_intent_id': payment_intent_id,
+            'is_applepay_express_transaction': is_applepay_express_transaction,
+        })
 
         return StripeTransactionResult(transaction=transaction)
 
@@ -207,9 +237,30 @@ class StripeApplepaySelectShippingMethod(graphene.Mutation):
         return StripeApplepaySelectShippingMethodResult(stripe_applepay_select_shipping_method=stripe_applepay_select_shipping_method)
 
 
+class StripeUpdatePaymentIntent(graphene.Mutation):
+    class Arguments:
+        transaction_reference = graphene.String(required=True)
+
+    Output = StripeUpdatePaymentIntentResult
+
+    @staticmethod
+    def mutate(self, info, transaction_reference):
+        env = info.context["env"]
+        PaymentTransaction = env['payment.transaction'].sudo()
+        transaction = PaymentTransaction.search([('reference', '=', transaction_reference)], limit=1)
+
+        if not transaction:
+            raise GraphQLError(_('Payment Transaction does not exist.'))
+        stripe_update_payment_intent = StripeControllerInherit().stripe_update_payment_intent(
+            transaction_reference=transaction_reference
+        )
+        return StripeUpdatePaymentIntentResult(stripe_update_payment_intent=stripe_update_payment_intent)
+
+
 class StripePaymentMutation(graphene.ObjectType):
     stripe_provider_info = StripeProviderInfo.Field(description='Get Stripe Provider Info.')
     stripe_get_inline_form_values = StripeGetInlineFormValues.Field(description='Get Stripe Inline Form Values')
     stripe_transaction = StripeTransaction.Field(description='Create Stripe Transaction')
     stripe_applepay_get_shipping_options = StripeApplepayGetShippingOptions.Field(description='Get Shipping Options on "Stripe - ApplePay"')
     stripe_applepay_select_shipping_method = StripeApplepaySelectShippingMethod.Field(description='Select Shipping Method on "Stripe - ApplePay"')
+    stripe_update_payment_intent = StripeUpdatePaymentIntent.Field(description='Update Stripe Payment Intent')

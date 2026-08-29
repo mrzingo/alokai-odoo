@@ -83,6 +83,9 @@
                     </field>
                 </page>
                 <page name="redis_stock" string="Redis Stock">
+                    <group>
+                        <field name="total_free_qty"/>
+                    </group>
                     <field name="product_tmpl_redis_stock_ids" nolabel="1">
                         <tree>
                             <field name="website_id"/>
@@ -91,6 +94,17 @@
                     </field>
                 </page>
             </notebook>
+        </field>
+    </record>
+
+    <record id="product_template_tree_view" model="ir.ui.view">
+        <field name="name">product.template.tree</field>
+        <field name="model">product.template</field>
+        <field name="inherit_id" ref="product.product_template_tree_view"/>
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='standard_price']" position="after">
+                <field name="recent_sales_count"/>
+            </xpath>
         </field>
     </record>
 

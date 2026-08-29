@@ -47,7 +47,8 @@ class Login(graphene.Mutation):
     def mutate(self, info, email, password, subscribe_newsletter):
         env = info.context['env']
         website = env['website'].get_current_website()
-        order = website.sale_get_order(force_create=True)
+        # get public order
+        current_order = website.sale_get_order()
 
         # Set email in lowercase
         email = email.lower()
@@ -65,8 +66,16 @@ class Login(graphene.Mutation):
                     if user_match:
                         request.session.finalize(request.env)
 
-            # Update SO
-            order._update_sale_order(website, user)
+            if current_order and current_order.order_line:
+                order = current_order
+            else:
+                last_order = user.partner_id.last_website_so_id
+
+                if last_order and last_order.state in ['draft', 'sent']:
+                    order = last_order
+                    request.session['sale_order_id'] = order.id
+                else:
+                    order = None
 
             # Subscribe Newsletter
             if website.vsf_mailing_list_id and subscribe_newsletter:
@@ -82,7 +91,7 @@ class Login(graphene.Mutation):
 
             return LoginOutput(
                 user=user,
-                cart=website.sale_get_order(force_create=True),
+                cart=order,
                 wishlist_items=wishlist_items,
             )
 
@@ -116,7 +125,7 @@ class Register(graphene.Mutation):
     def mutate(self, info, name, email, password, subscribe_newsletter):
         env = info.context['env']
         website = env['website'].get_current_website()
-        order = website.sale_get_order(force_create=True)
+        order = website.sale_get_order()
 
         # Set email in lowercase
         email = email.lower()
@@ -136,7 +145,8 @@ class Register(graphene.Mutation):
         user = env['res.users'].sudo().search([('login', '=', data['login'])], limit=1)
 
         # Update SO
-        order._update_sale_order(website, user)
+        if order:
+            order._update_sale_order(website, user)
 
         # Subscribe Newsletter
         if website and website.vsf_mailing_list_id and subscribe_newsletter:
@@ -215,13 +225,11 @@ class UpdatePassword(graphene.Mutation):
     @staticmethod
     def mutate(self, info, current_password, new_password):
         env = info.context['env']
-        website = env['website'].get_current_website()
-        website_user = website.user_id
         if env.uid:
             user = env['res.users'].sudo().search([('id', '=', env.uid), ('active', 'in', [True, False])], limit=1)
 
             # Prevent "Public User" to be Updated
-            if user and user.id and user.id == website_user.id:
+            if user and user.is_public_user:
                 raise GraphQLError(_('Partner cannot be updated.'))
             try:
                 user._check_credentials(current_password, env)
@@ -305,6 +313,7 @@ class CheckoutRedirect(graphene.Mutation):
                     pipe = redis_client.pipeline()
                     pipe.set(access_token, session_id, ex=60)  # 60-second TTL
                     pipe.execute()
+                    redis_client.close()
             except:
                 pass
 

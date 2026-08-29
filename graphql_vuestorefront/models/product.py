@@ -10,25 +10,28 @@ from odoo import models, fields, api, _
 from odoo.tools.float_utils import float_round
 from odoo.addons.http_routing.models.ir_http import slugify
 from odoo.exceptions import ValidationError
+from psycopg2.extras import execute_values
 
 
 class ProductTemplate(models.Model):
     _inherit = 'product.template'
 
     @api.model
-    def _graphql_get_search_order(self, sort):
-        sorting = 'has_stock DESC'
-        for field, val in sort.items():
-            if sorting:
-                sorting += ', '
-            if field == 'price':
-                sorting += 'list_price %s' % val.value
-            elif field == 'popular':
-                sorting += 'recent_sales_count %s' % val.value
-            elif field == 'newest':
-                sorting += 'published_datetime %s, create_date %s' % (val.value, val.value)
-            else:
-                sorting += '%s %s' % (field, val.value)
+    def _graphql_get_search_order(self, sort=None):
+        sorting = ''
+
+        if sort is not None:
+            for field, val in sort.items():
+                if sorting:
+                    sorting += ', '
+                if field == 'price':
+                    sorting += 'list_price %s' % val.value
+                elif field == 'popular':
+                    sorting += 'recent_sales_count %s' % val.value
+                elif field == 'newest':
+                    sorting += 'published_datetime %s, create_date %s' % (val.value, val.value)
+                else:
+                    sorting += '%s %s' % (field, val.value)
 
         # Add id as last factor, so we can consistently get the same results
         if sorting:
@@ -37,6 +40,17 @@ class ProductTemplate(models.Model):
             sorting = 'id ASC'
 
         return sorting
+
+    @api.model
+    def _graphql_get_price_order_field(self, pricelist):
+        """Name of a stored column holding ``pricelist``'s price, or False.
+
+        When a column is available the product list can order and paginate by
+        price directly in SQL instead of pricing the whole matching catalogue
+        in Python. No such column is maintained here; overrides that cache
+        pricelist prices on the template can return one.
+        """
+        return False
 
     @api.model
     def _graphql_get_search_domain(self, search, **kwargs):
@@ -69,10 +83,17 @@ class ProductTemplate(models.Model):
 
         # Stock
         if kwargs.get('in_stock', False):
-            domains.append([
-                ('product_tmpl_redis_stock_ids.quantity', '>', 0),
-                ('product_tmpl_redis_stock_ids.website_id', '=', website.id)
-            ])
+            # TODO:
+            # Possible index to improve performance
+            # CREATE INDEX idx_redis_stock_website_quantity
+            # ON product_template_redis_stock (website_id, quantity, product_id);
+            self.env.cr.execute("""
+                SELECT DISTINCT product_id
+                FROM product_template_redis_stock
+                WHERE website_id = %s AND quantity > 0
+            """, (website.id,))
+            product_ids = [row[0] for row in self.env.cr.fetchall()]
+            domains.append([('id', 'in', product_ids)])
 
         if search:
             for srch in search.split(" "):
@@ -234,6 +255,8 @@ class ProductTemplate(models.Model):
             product.variant_attribute_value_ids = [(6, 0, attribute_values.ids)]
 
     def _compute_recent_sales_count(self):
+        self = self.filtered(lambda p: not isinstance(p.id, models.NewId))
+
         lookback_days = int(self.env['ir.config_parameter'].sudo().get_param('vsf_recent_sales_count_days', 30))
         date_days_ago = fields.Datetime.now() - timedelta(days=lookback_days)
         done_states = self.env['sale.report'].sudo()._get_done_states()
@@ -249,14 +272,27 @@ class ProductTemplate(models.Model):
         )
         sale_count_map = {group['product_id'][0]: group['product_uom_qty'] for group in sale_groups}
 
+        values = []
+
         for product in self:
             if product.detailed_type in ['product', 'consu']:
                 product_id = product.product_variant_id.id
                 sales_count = sale_count_map.get(product_id, 0)
                 sales_count = float_round(sales_count, precision_rounding=product.uom_id.rounding)
-                product.recent_sales_count = sales_count + product.recent_sales_count_increment
+                recent_sales_count = sales_count + product.recent_sales_count_increment
             else:
-                product.recent_sales_count = 0
+                recent_sales_count = 0
+
+            values.append((recent_sales_count, product.id))
+
+        if values:
+            query = f"""
+                UPDATE product_template AS t
+                SET recent_sales_count = v.recent_sales_count
+                FROM (VALUES %s) AS v(recent_sales_count, id)
+                WHERE v.id = t.id
+            """
+            execute_values(self.env.cr, query, values)
 
     @api.depends('published_datetime')
     def _compute_published_hours(self):
@@ -266,6 +302,10 @@ class ProductTemplate(models.Model):
                 product.published_hours = int(delta.total_seconds() // 3600)
             else:
                 product.published_hours = 0
+
+    def _compute_total_free_qty(self):
+        for product in self:
+            product.total_free_qty = sum(product.product_variant_ids.mapped('free_qty'))
 
     variant_attribute_value_ids = fields.Many2many('product.attribute.value',
                                                    'product_template_variant_product_attribute_value_rel',
@@ -288,12 +328,50 @@ class ProductTemplate(models.Model):
                                          copy=False)
     published_hours = fields.Integer('Hours Published', compute='_compute_published_hours',
                                      help='Total hours the product has been published', readonly=True)
-    has_stock = fields.Boolean(string='Has Stock', compute='_compute_has_stock', store=True)
+    has_stock = fields.Boolean(string='Has Stock', compute='_compute_has_stock', search='_search_has_stock',
+                               store=False)
+    total_free_qty = fields.Float(
+        'Free To Use Quantity ', compute='_compute_total_free_qty',
+        digits='Product Unit of Measure', compute_sudo=False,
+        help="Forecast quantity (computed as Quantity On Hand "
+             "- reserved quantity)\n"
+             "In a context with a single Stock Location, this includes "
+             "goods stored in this location, or any of its children.\n"
+             "In a context with a single Warehouse, this includes "
+             "goods stored in the Stock Location of this Warehouse, or any "
+             "of its children.\n"
+             "Otherwise, this includes goods stored in any Stock Location "
+             "with 'internal' type.")
 
-    @api.depends('product_variant_ids.product_redis_stock_ids')
     def _compute_has_stock(self):
-        for template in self:
-            template.has_stock = sum(template.product_variant_ids.mapped('product_redis_stock_ids.quantity')) > 0
+        website = self.env['website'].get_current_website()
+        self.env.cr.execute("""
+            SELECT DISTINCT product_id
+            FROM product_template_redis_stock
+            WHERE website_id = %s AND quantity > 0
+        """, (website.id,))
+        product_ids = [row[0] for row in self.env.cr.fetchall()]
+        products_with_stock = set(product_ids)
+
+        for product in self:
+            product.has_stock = product.id in products_with_stock
+
+    def _search_has_stock(self, operator, value):
+        website = self.env['website'].get_current_website()
+        self.env.cr.execute("""
+            SELECT DISTINCT product_id
+            FROM product_template_redis_stock
+            WHERE website_id = %s AND quantity > 0
+        """, (website.id,))
+        product_ids = [row[0] for row in self.env.cr.fetchall()]
+
+        # We only handle True/False filters here
+        if (operator in ('=', '==') and value) or (operator == '!=' and not value):
+            # has_stock = True
+            return [('id', 'in', product_ids)]
+        else:
+            # has_stock = False
+            return [('id', 'not in', product_ids)]
 
     @api.model_create_multi
     def create(self, vals_list):
@@ -342,9 +420,6 @@ class ProductTemplate(models.Model):
 
     @api.model
     def calculate_frequently_bought_together(self):
-        ProductTemplateFBT = self.env['product.template.fbt']
-        ProductTemplateFBT.search([]).unlink()
-
         lookback_days = int(self.env['ir.config_parameter'].sudo().get_param('vsf_recent_sales_count_days', 30))
         date_days_ago = fields.Datetime.now() - timedelta(days=lookback_days)
         done_states = self.env['sale.report'].sudo()._get_done_states()
@@ -363,7 +438,7 @@ class ProductTemplate(models.Model):
                 order_to_products[order_id].append((product_id, qty))
 
         product_relations = defaultdict(lambda: defaultdict(float))
-        for order, products in order_to_products.items():
+        for _, products in order_to_products.items():
             # For each order, track pairs of products and add their quantities
             for i in range(len(products)):
                 for j in range(i + 1, len(products)):
@@ -373,15 +448,21 @@ class ProductTemplate(models.Model):
                     product_relations[product_a][product_b] += min(qty_a, qty_b)
                     product_relations[product_b][product_a] += min(qty_a, qty_b)
 
+        cr = self.env.cr
+        cr.execute('TRUNCATE TABLE product_template_fbt RESTART IDENTITY CASCADE')
+
+        values = []
         for product_id, related_products in product_relations.items():
             related_product_pairs = sorted(related_products.items(), key=lambda p: -p[1])
-
             for related_product_id, qty in related_product_pairs:
-                ProductTemplateFBT.create({
-                    'product_id': product_id,
-                    'related_product_id': related_product_id,
-                    'qty': qty,
-                })
+                values.append((product_id, related_product_id, qty))
+
+        if values:
+            query = f"""
+                INSERT INTO product_template_fbt (product_id, related_product_id, qty)
+                VALUES %s
+            """
+            execute_values(cr, query, values)
 
     def _has_no_variant_attributes(self):
             """ Overwrite : always return False regardless of product attributes variant creation mode setting
@@ -405,12 +486,38 @@ class ProductProduct(models.Model):
     _inherit = 'product.product'
 
     product_redis_stock_ids = fields.One2many('product.product.redis_stock', 'product_id', 'Redis Stock', readonly=True)
-    has_stock = fields.Boolean(string='Has Stock', compute='_compute_has_stock', store=True)
+    has_stock = fields.Boolean(string='Has Stock', compute='_compute_has_stock', search='_search_has_stock',
+                               store=False)
 
-    @api.depends('product_redis_stock_ids')
     def _compute_has_stock(self):
+        website = self.env['website'].get_current_website()
+        self.env.cr.execute("""
+            SELECT DISTINCT product_id
+            FROM product_product_redis_stock
+            WHERE website_id = %s AND quantity > 0
+        """, (website.id,))
+        product_ids = [row[0] for row in self.env.cr.fetchall()]
+        products_with_stock = set(product_ids)
+
         for product in self:
-            product.has_stock = sum(product.product_redis_stock_ids.mapped('quantity')) > 0
+            product.has_stock = product.id in products_with_stock
+
+    def _search_has_stock(self, operator, value):
+        website = self.env['website'].get_current_website()
+        self.env.cr.execute("""
+            SELECT DISTINCT product_id
+            FROM product_product_redis_stock
+            WHERE website_id = %s AND quantity > 0
+        """, (website.id,))
+        product_ids = [row[0] for row in self.env.cr.fetchall()]
+
+        # We only handle True/False filters here
+        if (operator in ('=', '==') and value) or (operator == '!=' and not value):
+            # has_stock = True
+            return [('id', 'in', product_ids)]
+        else:
+            # has_stock = False
+            return [('id', 'not in', product_ids)]
 
     def _compute_json_ld(self):
         env = self.env
@@ -459,27 +566,33 @@ class ProductProduct(models.Model):
     @api.model
     def _update_dirty_products_stock_redis(self):
         redis_client = self.env['website']._redis_connect()
-        dirty_keys = [key for key in redis_client.scan_iter('stock:product-is-dirty-*')]
-        product_ids = [int(redis_client.get(dirty_key)) for dirty_key in dirty_keys]
-        products = self.search([('id', 'in', product_ids)])
+        try:
+            dirty_keys = list(redis_client.scan_iter('stock:product-is-dirty-*'))
+            if not dirty_keys:
+                return
 
-        products._update_products_stock_redis(redis_client)
+            values = [redis_client.get(k) for k in dirty_keys]
+            product_ids = list({int(v) for v in values if v is not None})
+            if product_ids:
+                products = self.search([('id', 'in', product_ids)])
+                products._update_products_stock_redis(redis_client)
 
-        for dirty_key in dirty_keys:
-            redis_client.delete(dirty_key)
+            for dirty_key in dirty_keys:
+                redis_client.delete(dirty_key)
+        finally:
+            redis_client.close()
 
     @api.model
     def _update_all_products_stock_redis(self):
         redis_client = self.env['website']._redis_connect()
         products = self.search([])
         products._update_products_stock_redis(redis_client)
+        redis_client.close()
 
     def _update_products_stock_redis(self, redis_client):
         if not self:
             return
 
-        ProductProductRedisStock = self.env['product.product.redis_stock']
-        ProductTemplateRedisStock = self.env['product.template.redis_stock']
         StockWarehouse = self.env['stock.warehouse']
         pipe = redis_client.pipeline()
 
@@ -491,22 +604,28 @@ class ProductProduct(models.Model):
             for website in websites
         }
 
+        product_stock_values = []
+        template_stock_values = []
+
         for product in self:
             data = {}
             for website in websites:
                 lot_stock_ids = website_warehouses_map.get(website.id, [])
                 free_qty = product.with_context(location=lot_stock_ids).free_qty
-                ProductProductRedisStock.create_redis_stock(product.id, website.id, free_qty)
                 data[website.id] = free_qty
+                product_stock_values.append((product.id, website.id, free_qty))
             pipe.set(f'stock:product-{product.id}', json.dumps(data))
 
         for product_tmpl in product_tmpls:
             for website in websites:
                 lot_stock_ids = website_warehouses_map.get(website.id, [])
                 free_qty = sum(product_tmpl.product_variant_ids.with_context(location=lot_stock_ids).mapped('free_qty'))
-                ProductTemplateRedisStock.create_redis_stock(product_tmpl.id, website.id, free_qty)
+                template_stock_values.append((product_tmpl.id, website.id, free_qty))
 
         pipe.execute()
+
+        self.env['product.product.redis_stock'].bulk_update_redis_stock(product_stock_values)
+        self.env['product.template.redis_stock'].bulk_update_redis_stock(template_stock_values)
 
 
 class ProductStockRedis(models.AbstractModel):
@@ -516,30 +635,46 @@ class ProductStockRedis(models.AbstractModel):
     quantity = fields.Float('Quantity', digits='Product Unit of Measure', required=True)
 
     @api.model
-    def create_redis_stock(self, product_id, website_id, quantity):
-        line = self.search([('product_id', '=', product_id), ('website_id', '=', website_id)])
-        if line:
-            line.quantity = quantity
-        else:
-            self.create({
-                'product_id': product_id,
-                'website_id': website_id,
-                'quantity': quantity,
-            })
+    def bulk_update_redis_stock(self, values):
+        """
+        Efficiently upsert multiple redis stock records.
+
+        :param values: list of tuples (product_id, website_id, quantity)
+        :param table_name: str, target PostgreSQL table name
+        """
+        if not values:
+            return
+
+        query = f"""
+            INSERT INTO {self._table} (product_id, website_id, quantity)
+            VALUES %s
+            ON CONFLICT (product_id, website_id)
+            DO UPDATE SET quantity = EXCLUDED.quantity
+        """
+
+        execute_values(self.env.cr, query, values, page_size=1000)
 
 
 class ProductProductRedisStock(models.Model):
     _name = 'product.product.redis_stock'
     _inherit = 'product.redis_stock'
 
-    product_id = fields.Many2one('product.product', 'Product', required=True)
+    product_id = fields.Many2one('product.product', 'Product', required=True, ondelete='cascade')
+
+    _sql_constraints = [
+        ('unique_product_website', 'unique(product_id, website_id)', 'Product and Website must be unique!')
+    ]
 
 
 class ProductTemplateRedisStock(models.Model):
     _name = 'product.template.redis_stock'
     _inherit = 'product.redis_stock'
 
-    product_id = fields.Many2one('product.template', 'Product', required=True)
+    product_id = fields.Many2one('product.template', 'Product', required=True, ondelete='cascade')
+
+    _sql_constraints = [
+        ('unique_template_website', 'unique(product_id, website_id)', 'Template and Website must be unique!')
+    ]
 
 
 class ProductPublicCategory(models.Model):
